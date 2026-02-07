@@ -53,8 +53,9 @@ var (
 
 func ExtractMeta(data []byte, spaceFromCli string, titleFromH1 bool, titleFromFilename bool, filename string, parents []string, titleAppendGeneratedHash bool) (*Meta, []byte, error) {
 	var (
-		meta   *Meta
-		offset int
+		meta           *Meta
+		offset         int
+		stopProcessing bool
 	)
 
 	scanner := bufio.NewScanner(bytes.NewBuffer(data))
@@ -121,8 +122,10 @@ func ExtractMeta(data []byte, spaceFromCli string, titleFromH1 bool, titleFromFi
 			meta.Labels = append(meta.Labels, value)
 
 		case HeaderInclude:
-			// Includes are parsed by a different func
-			continue
+			// Includes are parsed by a different func.
+			// Keep the include directive in the document.
+			offset -= len(line) + 1
+			stopProcessing = true
 
 		case ContentAppearance:
 			if strings.TrimSpace(value) == FixedContentAppearance {
@@ -140,6 +143,10 @@ func ExtractMeta(data []byte, spaceFromCli string, titleFromH1 bool, titleFromFi
 			)
 
 			continue
+		}
+
+		if stopProcessing {
+			break
 		}
 	}
 
