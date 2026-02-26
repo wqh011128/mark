@@ -85,6 +85,59 @@ func ProcessIncludes(
 	contents []byte,
 	templates *template.Template,
 ) (*template.Template, []byte, bool, error) {
+	stripBlockQuote := func(line []byte) []byte {
+		trimmed := bytes.TrimLeft(line, " \t")
+		for len(trimmed) > 0 && trimmed[0] == '>' {
+			trimmed = bytes.TrimLeft(trimmed[1:], " \t")
+		}
+
+		return trimmed
+	}
+
+	isFenceLine := func(line []byte) (byte, int, bool) {
+		trimmed := stripBlockQuote(line)
+		if len(trimmed) < 3 {
+			return 0, 0, false
+		}
+
+		switch trimmed[0] {
+		case '`', '~':
+		default:
+			return 0, 0, false
+		}
+
+		char := trimmed[0]
+		count := 0
+		for count < len(trimmed) && trimmed[count] == char {
+			count++
+		}
+
+		if count < 3 {
+			return 0, 0, false
+		}
+
+		return char, count, true
+	}
+
+	isFenceClose := func(line []byte, fenceChar byte, fenceLen int) bool {
+		trimmed := stripBlockQuote(line)
+		if len(trimmed) < fenceLen {
+			return false
+		}
+
+		count := 0
+		for count < len(trimmed) && trimmed[count] == fenceChar {
+			count++
+		}
+
+		if count < fenceLen {
+			return false
+		}
+
+		rest := bytes.TrimSpace(trimmed[count:])
+		return len(rest) == 0
+	}
+
 	vardump := func(
 		facts *karma.Context,
 		data map[string]interface{},
@@ -109,68 +162,125 @@ func ProcessIncludes(
 		err     error
 	)
 
-	contents = reIncludeDirective.ReplaceAllFunc(
-		contents,
-		func(spec []byte) []byte {
-			if err != nil {
-				return nil
-			}
+	processSegment := func(segment []byte) []byte {
+		return reIncludeDirective.ReplaceAllFunc(
+			segment,
+			func(spec []byte) []byte {
+				if err != nil {
+					return nil
+				}
 
-			groups := reIncludeDirective.FindSubmatch(spec)
+				groups := reIncludeDirective.FindSubmatch(spec)
 
-			var (
-				path       = string(groups[1])
-				delimsNone = string(groups[2])
-				left       = string(groups[3])
-				right      = string(groups[4])
-				config     = groups[5]
-				data       = map[string]interface{}{}
+				var (
+					path       = string(groups[1])
+					delimsNone = string(groups[2])
+					left       = string(groups[3])
+					right      = string(groups[4])
+					config     = groups[5]
+					data       = map[string]interface{}{}
 
-				facts = karma.Describe("path", path)
-			)
-
-			if delimsNone == "none" {
-				left = "\x00"
-				right = "\x01"
-			}
-
-			err = yaml.Unmarshal(config, &data)
-			if err != nil {
-				err = facts.
-					Describe("config", string(config)).
-					Format(
-						err,
-						"unable to unmarshal template data config",
-					)
-
-				return nil
-			}
-
-			log.Tracef(vardump(facts, data), "including template %q", path)
-
-			templates, err = LoadTemplate(base, includePath, path, left, right, templates)
-			if err != nil {
-				err = facts.Format(err, "unable to load template")
-				return nil
-			}
-
-			var buffer bytes.Buffer
-
-			err = templates.Execute(&buffer, data)
-			if err != nil {
-				err = vardump(facts, data).Format(
-					err,
-					"unable to execute template",
+					facts = karma.Describe("path", path)
 				)
 
-				return nil
+				if delimsNone == "none" {
+					left = "\x00"
+					right = "\x01"
+				}
+
+				err = yaml.Unmarshal(config, &data)
+				if err != nil {
+					err = facts.
+						Describe("config", string(config)).
+						Format(
+							err,
+							"unable to unmarshal template data config",
+						)
+
+					return nil
+				}
+
+				log.Tracef(vardump(facts, data), "including template %q", path)
+
+				templates, err = LoadTemplate(base, includePath, path, left, right, templates)
+				if err != nil {
+					err = facts.Format(err, "unable to load template")
+					return nil
+				}
+
+				var buffer bytes.Buffer
+
+				err = templates.Execute(&buffer, data)
+				if err != nil {
+					err = vardump(facts, data).Format(
+						err,
+						"unable to execute template",
+					)
+
+					return nil
+				}
+
+				recurse = true
+
+				return buffer.Bytes()
+			},
+		)
+	}
+
+	lines := bytes.Split(contents, []byte("\n"))
+	var output bytes.Buffer
+	var segment bytes.Buffer
+	inFence := false
+	fenceChar := byte(0)
+	fenceLen := 0
+
+	flushSegment := func() {
+		if segment.Len() == 0 {
+			return
+		}
+
+		output.Write(processSegment(segment.Bytes()))
+		segment.Reset()
+	}
+
+	for index, line := range lines {
+		hasNewline := index < len(lines)-1
+
+		if inFence {
+			output.Write(line)
+			if hasNewline {
+				output.WriteByte('\n')
 			}
 
-			recurse = true
+			if isFenceClose(line, fenceChar, fenceLen) {
+				inFence = false
+			}
 
-			return buffer.Bytes()
-		},
-	)
+			continue
+		}
+
+		if char, count, ok := isFenceLine(line); ok {
+			flushSegment()
+			inFence = true
+			fenceChar = char
+			fenceLen = count
+
+			output.Write(line)
+			if hasNewline {
+				output.WriteByte('\n')
+			}
+
+			continue
+		}
+
+		segment.Write(line)
+		if hasNewline {
+			segment.WriteByte('\n')
+		}
+	}
+
+	flushSegment()
+	contents = output.Bytes()
 
 	return templates, contents, recurse, err
 }
